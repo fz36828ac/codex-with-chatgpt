@@ -15,6 +15,7 @@
     "dev": "tsx src/cli/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:local": "node scripts/local-smoke.mjs",
     "typecheck": "tsc --noEmit"
   },
   "packageManager": "pnpm@11.24.0",

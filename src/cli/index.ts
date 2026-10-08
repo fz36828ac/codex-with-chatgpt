@@ -28,6 +28,7 @@ import {
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
 import { getStateDir } from "../config/paths.js";
+import { resolveUpdateTarget } from "../config/update-target.js";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
 import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
 import {
@@ -855,7 +856,7 @@ acceptUnusedWorkspaceOption(
   .action((opts: { force: boolean; json: boolean }) => {
     const file = path.join(getStateDir(), "update-check.json");
     const today = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD in local tz
-    let last: { date?: string; updateAvailable?: boolean } = {};
+    let last: { date?: string; updateAvailable?: boolean; target?: string; localCommit?: string } = {};
     try {
       last = JSON.parse(fs.readFileSync(file, "utf8")) as typeof last;
     } catch {
@@ -874,13 +875,19 @@ acceptUnusedWorkspaceOption(
       else say(data.note ?? "已是最新版本。");
     };
 
-    if (!opts.force && last.date === today) {
+    const local = runGit(["rev-parse", "HEAD"]);
+    const target = resolveUpdateTarget(runGit);
+    const targetKey = target ? `${target.remote}:${target.ref}` : null;
+    if (!opts.force && targetKey && last.date === today && last.target === targetKey && last.localCommit === local.stdout) {
       emit({ checked: false, updateAvailable: last.updateAvailable ?? false, note: "今天已检查过更新。" });
       return;
     }
 
-    const local = runGit(["rev-parse", "HEAD"]);
-    const remote = runGit(["ls-remote", "origin", "HEAD"]);
+    if (!target) {
+      emit({ checked: false, updateAvailable: false, note: "固定提交安装，已跳过自动更新检查。" });
+      return;
+    }
+    const remote = runGit(["ls-remote", target.remote, target.ref]);
     if (!local.ok || !remote.ok || !remote.stdout) {
       // Offline or not a git checkout: skip quietly and retry tomorrow-ish (do not
       // record the date so a transient failure does not suppress the daily check).
@@ -890,7 +897,7 @@ acceptUnusedWorkspaceOption(
     const remoteCommit = remote.stdout.split(/\s/)[0];
     const updateAvailable = remoteCommit !== local.stdout;
     fs.mkdirSync(getStateDir(), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ date: today, updateAvailable, remoteCommit }), { mode: 0o600 });
+    fs.writeFileSync(file, JSON.stringify({ date: today, updateAvailable, remoteCommit, target: targetKey, localCommit: local.stdout }), { mode: 0o600 });
     emit({ checked: true, updateAvailable, localCommit: local.stdout, remoteCommit });
   });
 
