@@ -80,6 +80,7 @@ function stringRecord(value: unknown): Record<string, string> {
 const DEFAULT_MAX_LINES = 400;
 const HARD_MAX_LINES = 2000;
 const DEFAULT_MAX_BYTES = 256 * 1024;
+const HARD_MAX_TEXT_FILE_BYTES = 16 * 1024 * 1024;
 
 export class Workspace {
   readonly root: string;
@@ -160,10 +161,14 @@ export class Workspace {
     if (rel.startsWith("..")) {
       throw new WorkspaceError("PATH_OUTSIDE_WORKSPACE", `Path resolves outside the connected workspace: ${requested}`);
     }
-    if (!opts.allowSensitive && rel !== "" && this.ignoreRules.isSensitive(rel)) {
+    const requestedRel = path.relative(this.root, abs).split(path.sep).join("/");
+    const sensitiveRel = this.contains(abs) && this.ignoreRules.isSensitive(requestedRel)
+      ? requestedRel
+      : rel;
+    if (!opts.allowSensitive && sensitiveRel !== "" && this.ignoreRules.isSensitive(sensitiveRel)) {
       throw new WorkspaceError(
         "ACCESS_DENIED_SENSITIVE_FILE",
-        `ACCESS_DENIED_SENSITIVE_FILE: '${rel}' matches the sensitive-file policy and cannot be read.`
+        `ACCESS_DENIED_SENSITIVE_FILE: '${sensitiveRel}' matches the sensitive-file policy and cannot be read.`
       );
     }
     return { abs: canonical, rel };
@@ -197,6 +202,9 @@ export class Workspace {
     if (!stat.isFile()) {
       throw new WorkspaceError("NOT_A_FILE", `Not a regular file: ${rel}`);
     }
+    if (stat.size > HARD_MAX_TEXT_FILE_BYTES) {
+      throw new WorkspaceError("FILE_TOO_LARGE", `Text file exceeds the 16 MiB read limit: ${rel}`);
+    }
     if (await this.isBinary(abs)) {
       throw new WorkspaceError("BINARY_FILE", `Binary file (${stat.size} bytes): ${rel}. Content is not returned.`);
     }
@@ -214,22 +222,40 @@ export class Workspace {
     let byteTruncated = false;
     let actualEnd = startLine - 1;
 
-    const stream = fs.createReadStream(abs, { encoding: "utf8" });
+    // Read at most the file limit plus one sentinel byte, even if the file
+    // grows after stat(). Counting total lines must not scan an unbounded file.
+    const stream = fs.createReadStream(abs, { encoding: "utf8", end: HARD_MAX_TEXT_FILE_BYTES });
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    for await (const line of rl) {
-      totalLines++;
-      if (totalLines >= startLine && totalLines <= endLimit && !byteTruncated) {
-        const cost = Buffer.byteLength(line, "utf8") + 1;
-        if (collectedBytes + cost > maxBytes && lines.length > 0) {
-          byteTruncated = true;
-        } else {
-          lines.push(line);
-          collectedBytes += cost;
-          actualEnd = totalLines;
+    try {
+      for await (const line of rl) {
+        if (stream.bytesRead > HARD_MAX_TEXT_FILE_BYTES) {
+          throw new WorkspaceError("FILE_TOO_LARGE", `Text file exceeds the 16 MiB read limit: ${rel}`);
+        }
+        totalLines++;
+        if (totalLines >= startLine && totalLines <= endLimit && !byteTruncated) {
+          const cost = Buffer.byteLength(line, "utf8") + (lines.length > 0 ? 1 : 0);
+          if (collectedBytes + cost > maxBytes) {
+            // Line-based pagination cannot resume halfway through a line.
+            // Refuse an oversized first line instead of returning it whole
+            // or emitting an empty page whose nextStartLine never advances.
+            if (lines.length === 0) {
+              throw new WorkspaceError("FILE_TOO_LARGE", `Line ${totalLines} exceeds the ${maxBytes}-byte response limit: ${rel}`);
+            }
+            byteTruncated = true;
+          } else {
+            lines.push(line);
+            collectedBytes += cost;
+            actualEnd = totalLines;
+          }
         }
       }
+      if (stream.bytesRead > HARD_MAX_TEXT_FILE_BYTES) {
+        throw new WorkspaceError("FILE_TOO_LARGE", `Text file exceeds the 16 MiB read limit: ${rel}`);
+      }
+    } finally {
+      rl.close();
+      stream.destroy();
     }
-    rl.close();
 
     const remaining = Math.max(0, totalLines - actualEnd);
     return {

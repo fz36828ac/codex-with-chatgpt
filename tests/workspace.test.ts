@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { Workspace, WorkspaceError } from "../src/workspace/manager.js";
@@ -20,6 +20,8 @@ beforeAll(() => {
   write(root, "certs/server.pem", "PRIVATE KEY\n");
   write(root, "keys/id_rsa", "PRIVATE KEY\n");
   write(root, "nested/.ssh/config", "Host *\n");
+  write(root, ".git/config", "url=https://SYNTHETIC_CREDENTIAL@example.invalid/repo\n");
+  write(root, "nested/.git", "gitdir: /private/worktree-metadata\n");
   write(outside, "secret.txt", "outside data\n");
   write(root, ".c2cignore", "private-notes/\n");
   write(root, "private-notes/todo.md", "secret notes\n");
@@ -123,6 +125,32 @@ describe("sensitive files", () => {
     expectDenied("nested/.ssh/config");
   });
 
+  it("denies explicit Git metadata reads and worktree pointer files", async () => {
+    for (const p of [".git", ".git/config", "nested/.git", ".git\\config", "workspace:/.git/config"]) {
+      expectDenied(p);
+      await expect(ws.readFile(p)).rejects.toMatchObject({ code: "ACCESS_DENIED_SENSITIVE_FILE" });
+    }
+    await expect(ws.listDirectory(".git")).rejects.toMatchObject({ code: "ACCESS_DENIED_SENSITIVE_FILE" });
+  });
+
+  it("denies symlink aliases to Git metadata", async () => {
+    if (!symlinksReady) return;
+    fs.symlinkSync(path.join(root, ".git/config"), path.join(root, "git-config-alias.txt"));
+    await expect(ws.readFile("git-config-alias.txt")).rejects.toMatchObject({ code: "ACCESS_DENIED_SENSITIVE_FILE" });
+  });
+
+  it("denies sensitive lexical paths even when a symlink targets a safe file", async () => {
+    if (!symlinksReady) return;
+    const dir = makeTmpDir("git-pointer-link");
+    try {
+      write(dir, "public.txt", "safe content\n");
+      fs.symlinkSync(path.join(dir, "public.txt"), path.join(dir, ".git"));
+      await expect(new Workspace(dir).readFile(".git")).rejects.toMatchObject({ code: "ACCESS_DENIED_SENSITIVE_FILE" });
+    } finally {
+      cleanup(dir);
+    }
+  });
+
   it("honors .c2cignore custom rules", () => {
     expectDenied("private-notes/todo.md");
   });
@@ -133,10 +161,61 @@ describe("sensitive files", () => {
     expect(paths).toContain("hello.txt");
     expect(paths).not.toContain(".env");
     expect(paths.some((p) => p.includes("private-notes"))).toBe(false);
+    expect(paths.some((p) => p.includes(".git"))).toBe(false);
   });
 });
 
 describe("read_file pagination", () => {
+  it("rejects a first line exceeding the byte budget", async () => {
+    write(root, "oversized-line.txt", "x".repeat(2 * 1024 * 1024));
+    await expect(ws.readFile("oversized-line.txt", { maxBytes: 1024 })).rejects.toMatchObject({ code: "FILE_TOO_LARGE" });
+  });
+
+  it("allows content exactly at the byte budget", async () => {
+    write(root, "exact-line.txt", "x".repeat(1024));
+    const result = await ws.readFile("exact-line.txt", { maxBytes: 1024 });
+    expect(Buffer.byteLength(result.content, "utf8")).toBe(1024);
+    expect(result.truncated).toBe(false);
+  });
+
+  it("counts UTF-8 bytes rather than characters", async () => {
+    write(root, "unicode-line.txt", "😀".repeat(300));
+    await expect(ws.readFile("unicode-line.txt", { maxBytes: 1024 })).rejects.toMatchObject({ code: "FILE_TOO_LARGE" });
+  });
+
+  it("paginates whole lines within the budget and rejects an oversized next line", async () => {
+    write(root, "byte-pages.txt", "a".repeat(600) + "\n" + "b".repeat(600) + "\n" + "c".repeat(1200));
+    const first = await ws.readFile("byte-pages.txt", { maxBytes: 1024 });
+    expect(first.content).toBe("a".repeat(600));
+    expect(first.nextStartLine).toBe(2);
+    expect(first.remainingLines).toBe(2);
+    const second = await ws.readFile("byte-pages.txt", { startLine: first.nextStartLine!, maxBytes: 1024 });
+    expect(second.content).toBe("b".repeat(600));
+    expect(second.nextStartLine).toBe(3);
+    await expect(ws.readFile("byte-pages.txt", { startLine: second.nextStartLine!, maxBytes: 1024 }))
+      .rejects.toMatchObject({ code: "FILE_TOO_LARGE" });
+  });
+
+  it("rejects text files exceeding the scan limit even for a small range", async () => {
+    write(root, "oversized-file.txt", "small first line\n");
+    fs.truncateSync(path.join(root, "oversized-file.txt"), 16 * 1024 * 1024 + 1);
+    await expect(ws.readFile("oversized-file.txt", { startLine: 1, endLine: 1 }))
+      .rejects.toMatchObject({ code: "FILE_TOO_LARGE" });
+  });
+
+  it("enforces the scan limit if the file grows after its initial size check", async () => {
+    const file = write(root, "growing-file.txt", "ok\n" + "x".repeat(16 * 1024 * 1024));
+    const stats = await fs.promises.stat(file);
+    // Simulate a small file at stat time that has grown by the time it opens.
+    const statSpy = vi.spyOn(fs.promises, "stat").mockResolvedValueOnce(Object.assign(stats, { size: 3 }));
+    try {
+      await expect(ws.readFile("growing-file.txt", { startLine: 1, endLine: 1 }))
+        .rejects.toMatchObject({ code: "FILE_TOO_LARGE" });
+    } finally {
+      statSpy.mockRestore();
+    }
+  });
+
   it("caps unbounded reads at 400 lines and reports the remainder", async () => {
     const big = Array.from({ length: 1000 }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
     write(root, "big.txt", big);

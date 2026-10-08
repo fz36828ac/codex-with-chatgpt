@@ -7,6 +7,10 @@ import path from "node:path";
  * Matched with gitignore semantics against workspace-relative paths.
  */
 export const SENSITIVE_PATTERNS: string[] = [
+  // Git metadata can contain credential-bearing URLs, reflogs, or worktree
+  // pointers. Hide it AND reject explicit reads, including a .git file.
+  ".git",
+  ".git/",
   ".env",
   ".env.*",
   "!.env.example",
@@ -44,7 +48,6 @@ export const SENSITIVE_PATTERNS: string[] = [
 
 /** High-noise directories excluded from listing/search by default. */
 export const NOISE_PATTERNS: string[] = [
-  ".git/",
   "node_modules/",
   "dist/",
   "build/",
