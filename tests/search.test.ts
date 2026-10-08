@@ -64,6 +64,12 @@ describe.each(engines())("search engine: %s", (engine) => {
     expect(paths.some((p) => p.includes("node_modules"))).toBe(false);
   });
 
+  it("denies explicit searches inside Git metadata", async () => {
+    configure();
+    await expect(searchWorkspace(ws, { query: "credential", path: ".git/config" }))
+      .rejects.toMatchObject({ code: "ACCESS_DENIED_SENSITIVE_FILE" });
+  });
+
   it("respects the limit", async () => {
     configure();
     const result = await searchWorkspace(ws, { query: "needle-beta", limit: 10 });

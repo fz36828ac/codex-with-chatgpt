@@ -267,8 +267,9 @@ export function createMcpServer(ctx: McpContext): McpServer {
       title: "Read file",
       description:
         `Read a text file from the workspace with line-range pagination. Defaults to the first ` +
-        `400 lines; use start_line/end_line to page through large files. Sensitive files ` +
-        `(.env, keys, credentials) are always denied. ${UNTRUSTED_NOTE}`,
+        `400 lines; use start_line/end_line to page through large files. Responses are capped at ` +
+        `256 KiB and files at 16 MiB; an oversized first line returns FILE_TOO_LARGE. Sensitive files ` +
+        `(.git metadata, .env, keys, credentials) are always denied. ${UNTRUSTED_NOTE}`,
       inputSchema: {
         path: z.string().describe("Workspace-relative file path"),
         start_line: z.number().int().min(1).optional().describe("1-based first line to return"),

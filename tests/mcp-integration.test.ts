@@ -154,6 +154,29 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(textOf(result)).toContain("PATH_OUTSIDE_WORKSPACE");
   });
 
+  it("denies direct Git metadata access through MCP", async () => {
+    write(root, ".git/c2c-secret", "SYNTHETIC_GIT_CREDENTIAL\n");
+    for (const [name, args] of [
+      ["read_file", { path: ".git/config" }],
+      ["read_file", { path: ".git/c2c-secret" }],
+      ["list_directory", { path: ".git" }],
+      ["search_workspace", { path: ".git", query: "SYNTHETIC_GIT_CREDENTIAL" }],
+    ] as const) {
+      const result = await client.callTool({ name, arguments: args });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("ACCESS_DENIED_SENSITIVE_FILE");
+      expect(textOf(result)).not.toContain("SYNTHETIC_GIT_CREDENTIAL");
+    }
+  });
+
+  it("refuses an oversized first line instead of returning it through MCP", async () => {
+    write(root, "long-line.txt", "x".repeat(2 * 1024 * 1024));
+    const result = await client.callTool({ name: "read_file", arguments: { path: "long-line.txt" } });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("FILE_TOO_LARGE");
+    expect(Buffer.byteLength(textOf(result))).toBeLessThan(1024);
+  });
+
   it("list_directory lists the tree", async () => {
     const result = await client.callTool({ name: "list_directory", arguments: { path: ".", depth: 2 } });
     const listing = structuredJsonOf<{ entries: { path: string }[] }>(result);
